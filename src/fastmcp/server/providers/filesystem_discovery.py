@@ -8,6 +8,7 @@ This module provides functions to:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import sys
@@ -164,10 +165,8 @@ def import_module_from_file(
             ) from e
         finally:
             if path_added:
-                try:
+                with contextlib.suppress(ValueError):
                     sys.path.remove(package_parent)
-                except ValueError:
-                    pass
     else:
         # Import directly using spec_from_file_location
         stem = file_path.stem
@@ -227,10 +226,8 @@ def import_module_from_file(
             return module
         finally:
             if path_added:
-                try:
+                with contextlib.suppress(ValueError):
                     sys.path.remove(parent_dir)
-                except ValueError:
-                    pass
 
 
 def extract_components(module: ModuleType) -> list[FastMCPComponent]:
