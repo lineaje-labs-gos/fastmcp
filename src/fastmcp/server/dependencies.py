@@ -316,19 +316,18 @@ async def load_task_snapshot(
         return None
 
 
-# --- In-memory snapshot dict for sync access ---
-# Same bounded-dict pattern as _task_server_map. Populated at submission time
-# (same process), consulted by sync functions like get_http_request() in workers.
+# --- In-memory snapshot transfer buffer for sync access ---
+# Populated at submission time (same process), consumed on first access by the
+# worker. Entries are popped (not just read), so the dict only holds entries
+# for the brief window between submission and execution — bounded by task
+# concurrency, not by history.
 
-_task_snapshots: OrderedDict[str, TaskContextSnapshot] = OrderedDict()
-_TASK_SNAPSHOTS_MAX_SIZE = 10_000
+_task_snapshots: dict[str, TaskContextSnapshot] = {}
 
 
 def register_task_snapshot(task_id: str, snapshot: TaskContextSnapshot) -> None:
     """Store a snapshot for sync access by in-process workers."""
     _task_snapshots[task_id] = snapshot
-    while len(_task_snapshots) > _TASK_SNAPSHOTS_MAX_SIZE:
-        _task_snapshots.popitem(last=False)
 
 
 def _get_task_snapshot_sync() -> TaskContextSnapshot | None:
@@ -336,7 +335,7 @@ def _get_task_snapshot_sync() -> TaskContextSnapshot | None:
 
     Fallback chain:
     1. ContextVar (set by async deps like _CurrentContext)
-    2. In-memory dict (same-process workers)
+    2. In-memory transfer buffer (same-process workers, consumed on access)
     3. Sync Redis GET (out-of-process workers)
     """
     snapshot = _task_snapshot.get()
@@ -347,9 +346,10 @@ def _get_task_snapshot_sync() -> TaskContextSnapshot | None:
     if task_info is None:
         return None
 
-    # Same-process: check in-memory dict
-    snapshot = _task_snapshots.get(task_info.task_id)
+    # Same-process: pop from transfer buffer and cache in ContextVar
+    snapshot = _task_snapshots.pop(task_info.task_id, None)
     if snapshot is not None:
+        _task_snapshot.set(snapshot)
         return snapshot
 
     # Out-of-process: sync Redis fallback
