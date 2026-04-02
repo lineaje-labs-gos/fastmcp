@@ -1,26 +1,228 @@
-name: Publish FastMCP to PyPI
+name: Publish Workflow
+permissions:
+  contents: read
+
 on:
-  release:
-    types: [published]
+  push:
+    tag:
+      - v*
   workflow_dispatch:
+    inputs:
+      release_version:
+        description:  Provide the tag to publish the package
+        required: false
+      fixed_cves:
+        description:  Provide the list of CVEs fixed by this version
+        required: false
 
 jobs:
-  pypi-publish:
-    name: Upload to PyPI
+  build_test:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write # For PyPI's trusted publishing
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '' }}
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+
+      - name: Check out code
+        uses: actions/checkout@v4.1.7
         with:
-          fetch-depth: 0
+          ref: ${{ github.event.inputs.release_version }}
+          submodules: true
 
-      - name: "Install uv"
-        uses: astral-sh/setup-uv@v7
+      - name: Install JFrog CLI
+        run: curl -fL https://install-cli.jfrog.io | sh
 
-      - name: Build
-        run: uv build
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.12
+            3.11
+            3.10
 
-      - name: Publish to PyPi
-        run: uv publish -v dist/*
+      - name: Upgrade pip and install core tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build setuptools wheel twine
+
+      - name: Configure pip to use Artifactory
+        run: |
+          mkdir -p ~/.config/pip
+          cat > ~/.config/pip/pip.conf <<EOF
+          [global]
+          extra-index-url = https://${{ secrets.CUSTOMER_ZERO_USERNAME }}:${{ secrets.CUSTOMER_ZERO_TOKEN }}@${{ secrets.JFROG_HOST_NAME }}/artifactory/api/pypi/${{ secrets.PYPI_GOS_ALL_ARTIFACTORY }}/simple
+          trusted-host = ${{ secrets.JFROG_HOST_NAME }}
+          EOF
+
+      - name: Detect and install project dependencies
+        run: |
+          if [ -f pyproject.toml ]; then
+            echo "Detected pyproject.toml"
+            # poetry and flit support is yet to be added
+            # Default to PEP 517 build backend
+            python -m pip install -e .
+          elif [ -f requirements.txt ]; then
+            echo "Detected requirements.txt"
+            python -m pip install -r requirements.txt
+          elif [ -f setup.py ]; then
+            echo "Detected setup.py"
+            python -m pip install -e .
+          else
+            echo "No recognizable dependency file found!"
+          fi
+
+      - name: Detect and run tests
+        run: |
+          echo "Detecting test framework..."
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install pytest tox || true
+
+          if [ -f tox.ini ] || grep -q '\[tool.tox\]' pyproject.toml 2>/dev/null; then
+            echo "Running tests with tox..."
+            tox || echo "tox tests failed or not configured correctly"
+
+          elif [ -f pytest.ini ] || [ -d tests ] || grep -q '\[tool.pytest.ini_options\]' pyproject.toml 2>/dev/null; then
+            echo "Running tests with pytest..."
+            # Install test requirements if they exist
+            if [ -f test/requirements.txt ]; then
+              echo "Installing test dependencies from test/requirements.txt..."
+              python -m pip install -r test/requirements.txt || echo "Failed to install test requirements"
+            elif [ -f tests/requirements.txt ]; then
+              echo "Installing test dependencies from tests/requirements.txt..."
+              python -m pip install -r tests/requirements.txt || echo "Failed to install test requirements"
+            elif [ -f requirements-test.txt ]; then
+              echo "Installing test dependencies from requirements-test.txt..."
+              python -m pip install -r requirements-test.txt || echo "Failed to install test requirements"
+            elif [ -f test-requirements.txt ]; then
+              echo "Installing test dependencies from test-requirements.txt..."
+              python -m pip install -r test-requirements.txt || echo "Failed to install test requirements"
+            fi
+            python -m pytest -v || echo "pytest tests failed"
+
+          elif find . -type f -name "test_*.py" | grep -q .; then
+            echo "Running tests with unittest..."
+            python -m unittest discover -s . -p "test_*.py" || echo "unittest tests failed"
+
+          else
+            echo "No tests detected; skipping test stage"
+          fi
+
+  publish:
+    needs: build_test
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.1.7
+        with:
+          ref: ${{ github.event.inputs.release_version }}
+          submodules: true
+
+      - name: Install JFrog CLI
+        run: curl -fL https://install-cli.jfrog.io | sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.12
+            3.11
+            3.10
+
+      - name: Upgrade pip and install core tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build setuptools wheel twine
+
+      - name: Configure pip to use Artifactory
+        run: |
+          mkdir -p ~/.config/pip
+          cat > ~/.config/pip/pip.conf <<EOF
+          [global]
+          extra-index-url = https://${{ secrets.CUSTOMER_ZERO_USERNAME }}:${{ secrets.CUSTOMER_ZERO_TOKEN }}@${{ secrets.JFROG_HOST_NAME }}/artifactory/api/pypi/${{ secrets.PYPI_GOS_ALL_ARTIFACTORY }}/simple
+          trusted-host = ${{ secrets.JFROG_HOST_NAME }}
+          EOF
+
+      - name: Detect and install project dependencies
+        run: |
+          if [ -f pyproject.toml ]; then
+            echo "Detected pyproject.toml"
+            # poetry and flit support is yet to be added
+            # Default to PEP 517 build backend
+            python -m pip install -e .
+          elif [ -f requirements.txt ]; then
+            echo "Detected requirements.txt"
+            python -m pip install -r requirements.txt
+          elif [ -f setup.py ]; then
+            echo "Detected setup.py"
+            python -m pip install -e .
+          else
+            echo "No recognizable dependency file found!"
+          fi
+
+      - name: Build package
+        run: |
+          if [ -f requirements.txt ]; then
+            # Packaging is executed inside a venv. Include requirements.txt as setup.py may refer to it
+            echo "Updated MANIFEST.in for requirements.txt"
+            echo 'include requirements.txt' >> MANIFEST.in
+          fi
+          python -m build # builds both wheel + sdist
+        continue-on-error: false
+
+      - name: Import GPG private key
+        run: |
+            echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import --pinentry-mode loopback
+
+      - name: Sign all artifacts
+        run: |
+          for f in dist/*; do
+            echo "Signing $f"
+            gpg --batch --yes --armor \
+                --pinentry-mode loopback \
+                --detach-sign "$f"
+          done
+
+      - name: Publish to JFrog Artifactory
+        env:
+          ARTIFACTORY_URL: https://${{ secrets.JFROG_HOST_NAME }}/artifactory/api/pypi/${{ secrets.PYPI_STAGING_ARTIFACTORY }}
+          ARTIFACTORY_USER: ${{ secrets.JFROG_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
+        run: |
+          twine upload \
+            --repository-url "${ARTIFACTORY_URL}" \
+            -u "${ARTIFACTORY_USER}" -p "${ARTIFACTORY_PASSWORD}" \
+            dist/* 2>&1 | tee pypi-publish.log
+
+      - name: Upload publish log to Artifactory
+        run: |
+          PROJECT_NAME=${GITHUB_REPOSITORY##*/}
+          jf rt u "pypi-publish.log" "${{ secrets.PYPI_STAGING_ARTIFACTORY }}/logs/publish/${PROJECT_NAME}-${{ github.event.inputs.release_version }}/" --url https://${{ secrets.JFROG_HOST_NAME }}/artifactory/ --access-token=${{ secrets.JFROG_PASSWORD }}
+
+      - name: Upload all signed files and set CVE property in Artifactory
+        run: |
+          PROJECT_NAME=${GITHUB_REPOSITORY##*/}
+          # Extract PyPI version from the tag
+          RAW_VERSION=${{ github.event.inputs.release_version }}
+          # Strip leading "v"
+          version="${RAW_VERSION#v}"
+          # Split and reconstruct
+          main="${version%%-*}"       # 1.0.60
+          rest="${version#*-}"        # lineaje-01
+          label="${rest%-*}"          # lineaje
+          num="${rest##*-}"           # 01
+          num=$((10#$num))            # remove leading zeros
+          converted_version="${main}+${label}.${num}"
+
+          # Avoid setting additional vcs properties so that only one callback is executed
+          export JFROG_CLI_CI_VCS_PROPS_DISABLED=true
+          pushd dist > /dev/null 2>&1
+          jf rt u "*.asc" "${{ secrets.PYPI_STAGING_ARTIFACTORY }}/${PROJECT_NAME}/${converted_version}/" --url https://${{ secrets.JFROG_HOST_NAME }}/artifactory/ --access-token=${{ secrets.JFROG_PASSWORD }}
+          tar_gz_asc_file=$(find . -type f -name "*.tar.gz.asc" -print -quit)
+          popd > /dev/null 2>&1
+
+          tar_gz_asc_file=$(basename ${tar_gz_asc_file})
+          # Property is set on the source distribution signature file to prevent multiple calls
+          jf rt sp "${{ secrets.PYPI_STAGING_ARTIFACTORY }}/${PROJECT_NAME}/${converted_version}/${tar_gz_asc_file}" "fixed_cves=${{ github.event.inputs.fixed_cves }}" --url https://${{ secrets.JFROG_HOST_NAME }}/artifactory/ --access-token ${{ secrets.JFROG_PASSWORD }}
+

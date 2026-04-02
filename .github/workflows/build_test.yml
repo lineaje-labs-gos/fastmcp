@@ -1,0 +1,103 @@
+name: Build and Test Workflow
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - devtask/*
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description:  Provide the branch/tag to build and test
+        required: false
+
+jobs:
+
+  build_test:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '' }}
+
+    steps:
+
+      - name: Check out code
+        uses: actions/checkout@v4.1.7
+        with:
+          ref: ${{ github.event.inputs.release_version }}
+          submodules: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.12
+            3.11
+            3.10
+
+      - name: Upgrade pip and install core tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build setuptools wheel
+
+      - name: Configure pip to use Artifactory
+        run: |
+          mkdir -p ~/.config/pip
+          cat > ~/.config/pip/pip.conf <<EOF
+          [global]
+          extra-index-url = https://${{ secrets.CUSTOMER_ZERO_USERNAME }}:${{ secrets.CUSTOMER_ZERO_TOKEN }}@${{ secrets.JFROG_HOST_NAME }}/artifactory/api/pypi/${{ secrets.PYPI_GOS_ALL_ARTIFACTORY }}/simple
+          trusted-host = ${{ secrets.JFROG_HOST_NAME }}
+          EOF
+
+      - name: Detect and install project dependencies
+        run: |
+          if [ -f pyproject.toml ]; then
+            echo "Detected pyproject.toml"
+            # poetry and flit support is yet to be added
+            # Default to PEP 517 build backend
+            python -m pip install -e .
+          elif [ -f requirements.txt ]; then
+            echo "Detected requirements.txt"
+            python -m pip install -r requirements.txt
+          elif [ -f setup.py ]; then
+            echo "Detected setup.py"
+            python -m pip install -e .
+          else
+            echo "No recognizable dependency file found!"
+          fi
+
+      - name: Detect and run tests
+        run: |
+          echo "Detecting test framework..."
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install pytest tox || true
+
+          if [ -f tox.ini ] || grep -q '\[tool.tox\]' pyproject.toml 2>/dev/null; then
+            echo "Running tests with tox..."
+            tox || echo "tox tests failed or not configured correctly"
+
+          elif [ -f pytest.ini ] || [ -d tests ] || grep -q '\[tool.pytest.ini_options\]' pyproject.toml 2>/dev/null; then
+            echo "Running tests with pytest..."
+            # Install test requirements if they exist
+            if [ -f test/requirements.txt ]; then
+              echo "Installing test dependencies from test/requirements.txt..."
+              python -m pip install -r test/requirements.txt || echo "Failed to install test requirements"
+            elif [ -f tests/requirements.txt ]; then
+              echo "Installing test dependencies from tests/requirements.txt..."
+              python -m pip install -r tests/requirements.txt || echo "Failed to install test requirements"
+            elif [ -f requirements-test.txt ]; then
+              echo "Installing test dependencies from requirements-test.txt..."
+              python -m pip install -r requirements-test.txt || echo "Failed to install test requirements"
+            elif [ -f test-requirements.txt ]; then
+              echo "Installing test dependencies from test-requirements.txt..."
+              python -m pip install -r test-requirements.txt || echo "Failed to install test requirements"
+            fi
+            python -m pytest -v || echo "pytest tests failed"
+
+          elif find . -type f -name "test_*.py" | grep -q .; then
+            echo "Running tests with unittest..."
+            python -m unittest discover -s . -p "test_*.py" || echo "unittest tests failed"
+
+          else
+            echo "No tests detected; skipping test stage"
+          fi
